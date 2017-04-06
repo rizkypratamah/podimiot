@@ -1,435 +1,419 @@
-/**
- * Module dependencies.
- */
-
-var express = require('express'),
-    routes = require('./routes'),
-    user = require('./routes/user'),
-    http = require('http'),
-    path = require('path'),
-    fs = require('fs');
-
+var express = require('express');
+var cfenv = require('cfenv');
 var app = express();
+var request = require('request');
+var Cloudant = require('cloudant');
+var path = require('path');
+var bodyParser = require('body-parser');
+var json2csv = require('json2csv');
+var fs = require('fs');
+app.use(express.static(__dirname + '/public'));
 
+//To Store URL of Cloudant VCAP Services as found under environment variables on from App Overview page
+var cloudant_url;
+var services = JSON.parse(process.env.VCAP_SERVICES || "{}");
+// Check if services are bound to your project
+if(process.env.VCAP_SERVICES)
+{
+	services = JSON.parse(process.env.VCAP_SERVICES);
+	if(services.cloudantNoSQLDB) //Check if cloudantNoSQLDB service is bound to your project
+	{
+		cloudant_url = services.cloudantNoSQLDB[0].credentials.url;  //Get URL and other paramters
+		console.log("Name = " + services.cloudantNoSQLDB[0].name);
+		console.log("URL = " + services.cloudantNoSQLDB[0].credentials.url);
+        console.log("username = " + services.cloudantNoSQLDB[0].credentials.username);
+		console.log("password = " + services.cloudantNoSQLDB[0].credentials.password);
+	}
+}
+
+//Connect using cloudant npm and URL obtained from previous step
+var cloudant = Cloudant({url: cloudant_url});
+//Edit this variable value to change name of database.
+var dbname = 'names_database';
 var db;
 
-var cloudant;
+//Create database
+cloudant.db.create(dbname, function(err, data) {
+  	if(err) //If database already exists
+	    console.log("Database exists. Error : ", err); //NOTE: A Database can be created through the GUI interface as well
+  	else
+	    console.log("Created database.");
 
-var fileToUpload;
-
-var dbCredentials = {
-    dbName: 'my_sample_db'
-};
-
-var bodyParser = require('body-parser');
-var methodOverride = require('method-override');
-var logger = require('morgan');
-var errorHandler = require('errorhandler');
-var multipart = require('connect-multiparty')
-var multipartMiddleware = multipart();
-
-// all environments
-app.set('port', process.env.PORT || 3000);
-app.set('views', __dirname + '/views');
-app.set('view engine', 'ejs');
-app.engine('html', require('ejs').renderFile);
-app.use(logger('dev'));
-app.use(bodyParser.urlencoded({
-    extended: true
-}));
-app.use(bodyParser.json());
-app.use(methodOverride());
-app.use(express.static(path.join(__dirname, 'public')));
-app.use('/style', express.static(path.join(__dirname, '/views/style')));
-
-// development only
-if ('development' == app.get('env')) {
-    app.use(errorHandler());
-}
-
-function getDBCredentialsUrl(jsonData) {
-    var vcapServices = JSON.parse(jsonData);
-    // Pattern match to find the first instance of a Cloudant service in
-    // VCAP_SERVICES. If you know your service key, you can access the
-    // service credentials directly by using the vcapServices object.
-    for (var vcapService in vcapServices) {
-        if (vcapService.match(/cloudant/i)) {
-            return vcapServices[vcapService][0].credentials.url;
-        }
-    }
-}
-
-function initDBConnection() {
-    //When running on Bluemix, this variable will be set to a json object
-    //containing all the service credentials of all the bound services
-    if (process.env.VCAP_SERVICES) {
-        dbCredentials.url = getDBCredentialsUrl(process.env.VCAP_SERVICES);
-    } else { //When running locally, the VCAP_SERVICES will not be set
-
-        // When running this app locally you can get your Cloudant credentials
-        // from Bluemix (VCAP_SERVICES in "cf env" output or the Environment
-        // Variables section for an app in the Bluemix console dashboard).
-        // Once you have the credentials, paste them into a file called vcap-local.json.
-        // Alternately you could point to a local database here instead of a
-        // Bluemix service.
-        // url will be in this format: https://username:password@xxxxxxxxx-bluemix.cloudant.com
-        dbCredentials.url = getDBCredentialsUrl(fs.readFileSync("vcap-local.json", "utf-8"));
-    }
-
-    cloudant = require('cloudant')(dbCredentials.url);
-
-    // check if DB exists if not create
-    cloudant.db.create(dbCredentials.dbName, function(err, res) {
-        if (err) {
-            console.log('Could not create new db: ' + dbCredentials.dbName + ', it might already exist.');
-        }
-    });
-
-    db = cloudant.use(dbCredentials.dbName);
-}
-
-initDBConnection();
-
-app.get('/', routes.index);
-
-function createResponseData(id, name, value, attachments) {
-
-    var responseData = {
-        id: id,
-        name: sanitizeInput(name),
-        value: sanitizeInput(value),
-        attachements: []
-    };
-
-
-    attachments.forEach(function(item, index) {
-        var attachmentData = {
-            content_type: item.type,
-            key: item.key,
-            url: '/api/favorites/attach?id=' + id + '&key=' + item.key
-        };
-        responseData.attachements.push(attachmentData);
-
-    });
-    return responseData;
-}
-
-function sanitizeInput(str) {
-    return String(str).replace(/&(?!amp;|lt;|gt;)/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-var saveDocument = function(id, name, value, response) {
-
-    if (id === undefined) {
-        // Generated random id
-        id = '';
-    }
-
-    db.insert({
-        name: name,
-        value: value
-    }, id, function(err, doc) {
-        if (err) {
-            console.log(err);
-            response.sendStatus(500);
-        } else
-            response.sendStatus(200);
-        response.end();
-    });
-
-}
-
-app.get('/api/favorites/attach', function(request, response) {
-    var doc = request.query.id;
-    var key = request.query.key;
-
-    db.attachment.get(doc, key, function(err, body) {
-        if (err) {
-            response.status(500);
-            response.setHeader('Content-Type', 'text/plain');
-            response.write('Error: ' + err);
-            response.end();
-            return;
-        }
-
-        response.status(200);
-        response.setHeader("Content-Disposition", 'inline; filename="' + key + '"');
-        response.write(body);
-        response.end();
-        return;
-    });
+  	//Use the database for further operations like create view, update doc., read doc., delete doc. etc, by assigning dbname to db.
+  	db = cloudant.db.use(dbname);
+    //Create a design document. It stores the structure of the database and contains the design and map of views too
+    //A design doc. referred by _id = "_design/<any name your choose>"
+    //A view is used to limit the amount of data returned
+    //A design document is similar to inserting any other document, except _id starts with _design/.
+    //Name of the view and database are the same. It can be changed if desired.
+    //This view returns (i.e. emits) the id, revision number and new_city_name variable of all documents in the DB
+  	//membuat view untuk mempermudah pembacaan dari frontend
+  	db.insert(
+	 {
+		  	_id: "_design/data_gardudoc",
+		    views: {
+	  				  "names_database":
+	  				   {
+	      					"map": "function (doc) {\n  emit(doc.gardu, [doc.daerah, doc.gardu, doc.jumlahpelanggan, doc.totalsewa, doc.device]);\n}"
+	    			   }
+      	   		   }
+     },
+	 function(err, data) {
+	    	if(err)
+	    			console.log("View already exsits. Error: ", err); //NOTE: A View can be created through the GUI interface as well
+	    	else
+	    		console.log("names_database view has been created");
+	 });
 });
 
-app.post('/api/favorites/attach', multipartMiddleware, function(request, response) {
+//    ***************************************************** SEARCH DATABASE ************************************************************
+////// To search for a document directly, without using request module....
+////// It's crucial to know the ID of the document to be searched for.
+////// TIP: While inserting a new document, a JSON object can be created with '_id' variable set to the same value as 'new_name' as in this case
+////// This JSON document can be inserted whose _id can then be referenced for future search.
+////// Eg: _id = "mydoc".
+//
+//	   db.get("mydoc", function(err, data){
+//			if(!err)
+//				console.log("Found document : " + JSON.stringify(data));
+//  		else
+//      		console.log("Document not found in database");
+//	   });
 
-    console.log("Upload File Invoked..");
-    console.log('Request: ' + JSON.stringify(request.headers));
+//   ****************************************************** END OF SEARCH **************************************************************
 
-    var id;
+app.get('/fill_remove_update_names_dropdown', function(req, res){
+	console.log("To fill 'Update Names' and 'Remove Names' dropdown");
+	var url = cloudant_url + "/names_database/_design/names_database/_view/names_database";
+	request({
+			 url: url, //'request' makes a call to API URL which in turn returns a JSON to the variable 'body'
+			 json: true
+			}, function (error, response, body) {
+		if (!error && response.statusCode === 200)
+		{
+			var user_data = body.rows; //body.rows contains an array of IDs, Revision numbers and Names from the view
+			var list_of_names = '[';
+			var name_array = [];
 
-    db.get(request.query.id, function(err, existingdoc) {
+			//'user_data' is an array with all names
+			for(var i=0; i< user_data.length; i++)
+				name_array.push(user_data[i].value[1]);
+			    name_array.sort();
+			for(var i=0; i<name_array.length; i++)
+			{
+				var name_JSON = '{\"name\":\"' + name_array[i] + '\"}'; //create an array of names only
+				if(i !== 0)
+					list_of_names = list_of_names.concat(",");
+				list_of_names = list_of_names.concat(name_JSON);
+			}
+			list_of_names = list_of_names.concat("]");
+			res.contentType('application/json');
+			res.send(JSON.parse(list_of_names)); //Send names array to front end via res.send, which in turn populates drop down
+		}
+		else
+		{
+			console.log("No data from URL");
+			console.log("Response is : " + response.statusCode);
+			var name_string="{\"added\":\"DB read error\"}"; //Send error message in case 'request' can't read database
+			res.contentType('application/json');
+			res.send(JSON.parse(name_string));
+		}
+	});
+});
+app.get('/download_csv', function(req, res){
+	var fileName = __dirname + '\/' + "database_names.csv";
+	res.download(fileName);
+});
+//To update the 'Read Names' list
+app.get('/view_names',function(req, res){
+	var json_string_for_csv_conversion = new Array();
+	var url = cloudant_url + "/names_database/_design/names_database/_view/names_database";
+	request({
+			 url: url, //'request' makes a call to API URL which in turn returns a JSON to the variable 'body'
+			 json: true
+			}, function (error, response, body) {
+		if (!error && response.statusCode === 200)
+		{
+			var user_data = body.rows;  //body.rows contains an array of IDs, Revision numbers and Names from the view
+			var list_of_names = '[';
+			var name_array = [];
 
-        var isExistingDoc = false;
-        if (!existingdoc) {
-            id = '-1';
-        } else {
-            id = existingdoc.id;
-            isExistingDoc = true;
-        }
+			for(var i=0; i< user_data.length; i++)
+			{
+				name_array.push(user_data[i].value[1]);
+				var csv_data = new Array();
+				csv_data["|__Names_in_Database__|"]=user_data[i].value[1];
+				json_string_for_csv_conversion.push(csv_data);
+			}
+			var download_filename = "database_names.csv";
+			var fields =['|__Names_in_Database__|'];
+			json2csv({data: json_string_for_csv_conversion, fields: fields }, function(err, csv) {
+				if (err) console.log(err);
+				fs.writeFile(download_filename, csv, function(err) {
+					if (err) throw err;
+					console.log('file saved');
+					console.log(csv);
 
-        var name = sanitizeInput(request.query.name);
-        var value = sanitizeInput(request.query.value);
+					fs.readdir(__dirname, function (err, files) {
+						if (err)
+							throw err;
+						for (var index in files) {
+							if(files[index] === download_filename)
+								console.log(download_filename + " is present");
+						}
+					});
+				});
+			});
 
-        var file = request.files.file;
-        var newPath = './public/uploads/' + file.name;
-
-        var insertAttachment = function(file, id, rev, name, value, response) {
-
-            fs.readFile(file.path, function(err, data) {
-                if (!err) {
-
-                    if (file) {
-
-                        db.attachment.insert(id, file.name, data, file.type, {
-                            rev: rev
-                        }, function(err, document) {
-                            if (!err) {
-                                console.log('Attachment saved successfully.. ');
-
-                                db.get(document.id, function(err, doc) {
-                                    console.log('Attachements from server --> ' + JSON.stringify(doc._attachments));
-
-                                    var attachements = [];
-                                    var attachData;
-                                    for (var attachment in doc._attachments) {
-                                        if (attachment == value) {
-                                            attachData = {
-                                                "key": attachment,
-                                                "type": file.type
-                                            };
-                                        } else {
-                                            attachData = {
-                                                "key": attachment,
-                                                "type": doc._attachments[attachment]['content_type']
-                                            };
-                                        }
-                                        attachements.push(attachData);
-                                    }
-                                    var responseData = createResponseData(
-                                        id,
-                                        name,
-                                        value,
-                                        attachements);
-                                    console.log('Response after attachment: \n' + JSON.stringify(responseData));
-                                    response.write(JSON.stringify(responseData));
-                                    response.end();
-                                    return;
-                                });
-                            } else {
-                                console.log(err);
-                            }
-                        });
-                    }
-                }
-            });
-        }
-
-        if (!isExistingDoc) {
-            existingdoc = {
-                name: name,
-                value: value,
-                create_date: new Date()
-            };
-
-            // save doc
-            db.insert({
-                name: name,
-                value: value
-            }, '', function(err, doc) {
-                if (err) {
-                    console.log(err);
-                } else {
-
-                    existingdoc = doc;
-                    console.log("New doc created ..");
-                    console.log(existingdoc);
-                    insertAttachment(file, existingdoc.id, existingdoc.rev, name, value, response);
-
-                }
-            });
-
-        } else {
-            console.log('Adding attachment to existing doc.');
-            console.log(existingdoc);
-            insertAttachment(file, existingdoc._id, existingdoc._rev, name, value, response);
-        }
-
-    });
-
+			name_array.sort();
+			for(var i=0; i<name_array.length; i++)
+			{
+				var name_JSON = '{\"name\":\"' + name_array[i] + '\"}'; //create an array of names only
+				if(i !== 0)
+					list_of_names = list_of_names.concat(",");
+				list_of_names = list_of_names.concat(name_JSON);
+			}
+			list_of_names = list_of_names.concat("]");
+			res.contentType('application/json');
+			console.log("Returning names");
+			res.send(JSON.parse(list_of_names)); //return the list to front end for display
+		}
+		else
+		{
+			console.log("No data from URL");
+			console.log("Response is : " + response.statusCode);
+			var name_string="{\"added\":\"DB read error\"}"; //Send error message in case 'request' can't read database
+			res.contentType('application/json');
+			res.send(JSON.parse(name_string));
+		}
+	});
 });
 
-app.post('/api/favorites', function(request, response) {
+app.get('/add_name',function(req, res){ //to add a city into the database
+	console.log("Name to be added : = " + req.query.new_name);
+	req.query.new_name = req.query.new_name.toUpperCase(); //convert to uppercase and trim white space before inserting
+	req.query.new_name = req.query.new_name.trim();
 
-    console.log("Create Invoked..");
-    console.log("Name: " + request.body.name);
-    console.log("Value: " + request.body.value);
+	//Search through the DB completely to check for duplicate name, before adding a new name
+	var url = cloudant_url + "/names_database/_design/names_database/_view/names_database";
+	var name_present = 0; //flag variable for checking if name is already present before inserting
+	var name_string; //variable to store update for front end.
 
-    // var id = request.body.id;
-    var name = sanitizeInput(request.body.name);
-    var value = sanitizeInput(request.body.value);
+	//In this case, check if the ID is already present, else, insert a new document
+	request({
+			 url: url,
+			 json: true
+			}, function (error, response, body) {
+		if (!error && response.statusCode === 200)
+		{
+			//Check if current input is present in the table, else add. If present then return with error message
+			var user_data = body.rows;
+			console.log("length of table: " + user_data.length);
+			var loop_len = user_data.length;
+			for(var i=0; i< loop_len; i++)
+			{
+				var doc = user_data[i];
+				console.log("in Db : " + doc.value[1]);
+				if(req.query.new_name === doc.value[1])
+				{
+					name_present = 1;
+					break;
+				}
+			}
+			if(name_present === 0) //if city is not already in the list
+			{
+				db.insert(req.query, function(err, data){
+					if (!err)
+					{
+						console.log("Added new name");
+						name_string="{\"added\":\"Yes\"}";
+						res.contentType('application/json'); //res.contentType and res.send is added inside every block as code returns immediately
+						res.send(JSON.parse(name_string));
+					}
+					else
+					{
+						console.log("Error inserting into DB " + err);
+						name_string="{\"added\":\"DB insert error\"}";
+						res.contentType('application/json');
+						res.send(JSON.parse(name_string));
 
-    saveDocument(null, name, value, response);
-
-});
-
-app.delete('/api/favorites', function(request, response) {
-
-    console.log("Delete Invoked..");
-    var id = request.query.id;
-    // var rev = request.query.rev; // Rev can be fetched from request. if
-    // needed, send the rev from client
-    console.log("Removing document of ID: " + id);
-    console.log('Request Query: ' + JSON.stringify(request.query));
-
-    db.get(id, {
-        revs_info: true
-    }, function(err, doc) {
-        if (!err) {
-            db.destroy(doc._id, doc._rev, function(err, res) {
-                // Handle response
-                if (err) {
-                    console.log(err);
-                    response.sendStatus(500);
-                } else {
-                    response.sendStatus(200);
-                }
-            });
-        }
-    });
-
-});
-
-app.put('/api/favorites', function(request, response) {
-
-    console.log("Update Invoked..");
-
-    var id = request.body.id;
-    var name = sanitizeInput(request.body.name);
-    var value = sanitizeInput(request.body.value);
-
-    console.log("ID: " + id);
-
-    db.get(id, {
-        revs_info: true
-    }, function(err, doc) {
-        if (!err) {
-            console.log(doc);
-            doc.name = name;
-            doc.value = value;
-            db.insert(doc, doc.id, function(err, doc) {
-                if (err) {
-                    console.log('Error inserting data\n' + err);
-                    return 500;
-                }
-                return 200;
-            });
-        }
-    });
-});
-
-app.get('/api/favorites', function(request, response) {
-
-    console.log("Get method invoked.. ")
-
-    db = cloudant.use(dbCredentials.dbName);
-    var docList = [];
-    var i = 0;
-    db.list(function(err, body) {
-        if (!err) {
-            var len = body.rows.length;
-            console.log('total # of docs -> ' + len);
-            if (len == 0) {
-                // push sample data
-                // save doc
-                var docName = 'sample_doc';
-                var docDesc = 'A sample Document';
-                db.insert({
-                    name: docName,
-                    value: 'A sample Document'
-                }, '', function(err, doc) {
-                    if (err) {
-                        console.log(err);
-                    } else {
-
-                        console.log('Document : ' + JSON.stringify(doc));
-                        var responseData = createResponseData(
-                            doc.id,
-                            docName,
-                            docDesc, []);
-                        docList.push(responseData);
-                        response.write(JSON.stringify(docList));
-                        console.log(JSON.stringify(docList));
-                        console.log('ending response...');
-                        response.end();
-                    }
-                });
-            } else {
-
-                body.rows.forEach(function(document) {
-
-                    db.get(document.id, {
-                        revs_info: true
-                    }, function(err, doc) {
-                        if (!err) {
-                            if (doc['_attachments']) {
-
-                                var attachments = [];
-                                for (var attribute in doc['_attachments']) {
-
-                                    if (doc['_attachments'][attribute] && doc['_attachments'][attribute]['content_type']) {
-                                        attachments.push({
-                                            "key": attribute,
-                                            "type": doc['_attachments'][attribute]['content_type']
-                                        });
-                                    }
-                                    console.log(attribute + ": " + JSON.stringify(doc['_attachments'][attribute]));
-                                }
-                                var responseData = createResponseData(
-                                    doc._id,
-                                    doc.name,
-                                    doc.value,
-                                    attachments);
-
-                            } else {
-                                var responseData = createResponseData(
-                                    doc._id,
-                                    doc.name,
-                                    doc.value, []);
-                            }
-
-                            docList.push(responseData);
-                            i++;
-                            if (i >= len) {
-                                response.write(JSON.stringify(docList));
-                                console.log('ending response...');
-                                response.end();
-                            }
-                        } else {
-                            console.log(err);
-                        }
-                    });
-
-                });
-            }
-
-        } else {
-            console.log(err);
-        }
-    });
-
+					}
+				});
+		    }
+			else
+			{
+				console.log("Name is already present");
+				name_string="{\"added\":\"No\"}";
+				res.contentType('application/json');
+				res.send(JSON.parse(name_string));
+			}
+		}
+		else
+		{
+			console.log("No data from URL. Response : " + response.statusCode);
+			name_string="{\"added\":\"DB read error\"}";
+			res.contentType('application/json');
+			res.send(JSON.parse(name_string));
+		}
+	});
 });
 
 
-http.createServer(app).listen(app.get('port'), '0.0.0.0', function() {
-    console.log('Express server listening on port ' + app.get('port'));
+app.get('/update_name',function(req, res){ //to update a city into the database
+	console.log("Received : " + JSON.stringify(req.query));
+	req.query.updated_new_name = req.query.updated_new_name.toUpperCase();
+	req.query.updated_new_name = req.query.updated_new_name.trim();
+
+	//Search through the DB completely to retrieve document ID and revision number
+	var url = cloudant_url + "/names_database/_design/names_database/_view/names_database";
+	var name_present = 0;
+	request({
+			 url: url, //url returns doc id, revision number and name for each document
+			 json: true
+			}, function (error, response, body) {
+			if (!error && response.statusCode === 200)
+			{
+				var name_string;
+				var user_data = body.rows;
+				var id_to_remove; //for updating, document ID is essential.
+				//Format remains the same as adding new city name, except that document ID needs to be added
+				var rev_to_remove;
+				var total_rows = user_data.length;
+				for(var i=0; i< user_data.length; i++)
+				{
+					var doc = user_data[i];
+					if(doc.value[1] === req.query.name_list)
+					{
+						id_to_remove = doc.key;
+						rev_to_remove = doc.value[0];
+					}
+					if(doc.value[1] === req.query.updated_new_name)
+					{
+						name_present = 1;
+						break;
+					}
+				}
+				//create a document object before updating, containing ID of the doc. that needs to be updated, revision number and new name
+			    var string_to_update = "{\"new_name\":\"" + req.query.updated_new_name + "\",\"_id\":\"" +id_to_remove+"\",\"_rev\":\"" + rev_to_remove + "\"}";
+			    var update_obj = JSON.parse(string_to_update);
+				//if update name is not equal to existing name and database isn't empty then update document, else print error message
+				if(total_rows !== 0)
+				{
+					if(name_present === 0)
+					{
+						db.insert(update_obj, function(err, data)
+						{
+								if(!err)
+								{
+									console.log("Updated doc.");
+									name_string="{\"updated\":\"updated\"}";
+									res.contentType('application/json');//res.contentType and res.send is added inside every block as code returns immediately
+									res.send(JSON.parse(name_string));
+								}
+								else
+								{
+									console.log("Couldn't update name " + err);
+									name_string="{\"updated\":\"could not update\"}";
+									res.contentType('application/json');
+									res.send(JSON.parse(name_string));
+								}
+						});
+					}
+					else
+					{
+						console.log("Duplicate city");
+						name_string="{\"updated\":\"No\"}";
+						res.contentType('application/json');
+						res.send(JSON.parse(name_string));
+					}
+
+				}
+				else
+				{
+					console.log("DB is empty");
+					var name_string="{\"updated\":\"empty database\"}";
+					res.contentType('application/json');
+					res.send(JSON.parse(name_string));
+				}
+			}
+			else
+			{
+				console.log("No response from URL. Status : " + response.statusCode);
+				name_string="{\"updated\":\"DB read error\"}";
+				res.contentType('application/json');
+				res.send(JSON.parse(name_string));
+			}
+	});
+});
+
+app.get('/remove_name',function(req, res){ //to update a city into the database
+	console.log("Name to be removed : = " + req.query.name_to_remove);
+	//Search through the DB completely to retrieve document ID and revision number
+	var url = cloudant_url + "/names_database/_design/names_database/_view/names_database";
+	request({
+			 url: url, //url returns doc id, revision number and name for each document
+			 json: true
+			}, function (error, response, body) {
+			if (!error && response.statusCode === 200)
+			{
+				var name_string;
+				var user_data = body.rows;
+				var id_to_remove;
+				var rev_to_remove; //for removing, ID and revision number are essential.
+				var total_rows = user_data.length;
+				for(var i=0; i< user_data.length; i++)
+				{
+					var doc = user_data[i];
+					if(doc.value[1] === req.query.name_to_remove)
+					{
+						id_to_remove = doc.key;
+						rev_to_remove = doc.value[0];
+						break;
+					}
+				}
+				if(total_rows !== 0)
+				{
+				    db.destroy(id_to_remove, rev_to_remove, function(err)
+				    {
+						if(!err)
+						{
+							console.log("Removed name");
+							name_string="{\"removed\":\"removed\"}";
+							res.contentType('application/json');
+							res.send(JSON.parse(name_string));
+						}
+						else
+						{
+							console.log("Couldn't remove name");
+							console.log(err);
+							name_string="{\"removed\":\"could not remove\"}";
+							res.contentType('application/json');
+							res.send(JSON.parse(name_string));
+						}
+					});
+
+				}
+				else
+				{
+					console.log("DB is empty");
+					name_string="{\"removed\":\"empty database\"}";
+					res.contentType('application/json');
+					res.send(JSON.parse(name_string));
+				}
+			}
+			else
+			{
+				console.log("No data from URL");
+				console.log("Response is : " + response.statusCode);
+				name_string="{\"removed\":\"DB read error\"}";
+				res.contentType('application/json');
+				res.send(JSON.parse(name_string));
+			}
+	});
+
+});
+
+var appEnv = cfenv.getAppEnv();
+app.listen(appEnv.port, '0.0.0.0', function() {
+  console.log("server starting on " + appEnv.url);
 });
